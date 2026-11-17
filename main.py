@@ -3,11 +3,12 @@ concurrent viewers hour by hour (hours 2..24), as five quantiles an hour.
 
 The model (model.py, standard library only) anchors on the case's hour-1
 print and learns the launch-day shape from the case's own comparable
-launches: per hour, a quadratic regression of the log viewer ratio on
-ln(hour-1 print), median-shifted, with empirical residual quantiles
-rescaled by a heteroscedastic factor. Validated by leave-one-out
+launches: per hour, a piecewise-linear regression of the log viewer
+ratio on ln(hour-1 print) with a knot at the median, median-shifted,
+with empirical residual quantiles rescaled by one heteroscedastic
+factor pooled over all hours. Validated by leave-one-out
 cross-validation over the 37 comparable launch curves (pinball loss
-0.377 vs 0.930 for the persistence baseline).
+0.365 vs 0.930 for the persistence baseline).
 
 How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0)
 in python:3.13-slim, standard library only: no network, no pip packages.

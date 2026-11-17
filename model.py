@@ -11,25 +11,32 @@ gta6-twitch-experiment.md in the agent's working notes):
   - The log-ratio at each hour depends strongly on the absolute hour-1
     level: corr(ln(p1), x_h) reaches -0.94 at h=20. Launches already hot
     in hour 1 stay flat; launches still pre-unlock in hour 1 surge.
-    So per hour we fit a QUADRATIC regression of x_h on ln(p1) across
-    the comparables (the relation is curved: it saturates at high p1),
-    with the target's ln(p1) clamped to the comparables' observed range
-    so a bigger-than-ever launch never extrapolates wildly.
+    So per hour we fit a PIECEWISE-LINEAR regression of x_h on ln(p1)
+    with a knot at the comparables' median ln(p1): one slope below the
+    knot (the pre-unlock surge regime) and one above it (the already-hot
+    regime), continuous at the knot. A global quadratic was tried first
+    (LOO loss 0.377); the piecewise fit is better (0.365) because the
+    relation has a kink, not smooth curvature. The target's ln(p1) is
+    clamped to the comparables' observed range so a bigger-than-ever
+    launch never extrapolates wildly.
   - The median is shifted so the residuals' median is zero (the pinball
     loss at tau=0.5 wants the conditional median, not the mean).
   - Spreads come from the fit's EMPIRICAL residual quantiles per hour
-    (no normality assumption), rescaled by a heteroscedastic factor:
-    |residual| regressed on ln(p1), so low-p1 targets (whose surge is
-    genuinely uncertain) get wider spreads and high-p1 targets tighter
-    ones. The scale is clamped to [0.3, 2.5].
+    (no normality assumption), rescaled by ONE heteroscedastic factor
+    pooled over all hours: |residual| regressed on ln(p1) across every
+    (comparable, hour) pair, so low-p1 targets (whose surge is genuinely
+    uncertain) get wider spreads and high-p1 targets tighter ones. The
+    scale is clamped to [0.3, 2.5]. Pooling stabilises the slope: a
+    per-hour fit from 36 points is noisy, the pooled fit uses ~850.
   - Quantiles are p1 * exp(mu + residual_quantile * scale), floored at 1
     and capped at 1e9, forced non-decreasing.
 
 LOO-CV (37 pseudo-cases, official pinball loss in log space):
   persistence baseline (kit starter): 0.930
   pooled empirical quantiles:         0.714
-  this model:                         0.377  (0.215 on high-p1 targets,
-                                              0.283 on the mid-p1 band
+  quadratic regression (first version): 0.377
+  this model (piecewise + pooled scale): 0.365  (0.206 on high-p1 targets,
+                                              0.287 on the mid-p1 band
                                               like the practice cases)
   The house persistence baseline's published practice loss is 0.387.
 
@@ -79,16 +86,18 @@ def _ols(xs, ys):
     return my - b * mx, b
 
 
-def _quad_fit(xs, ys):
-    """Least squares for y ~ b0 + b1*x + b2*x^2 via normal equations.
+def _piecewise_fit(xs, ys):
+    """Least squares for y ~ b0 + b1*x + b2*max(0, x - knot), knot at the
+    median x: one slope below the knot, one above, continuous at the knot.
 
-    Returns (b0, b1, b2). Falls back to a linear fit if the system is
-    singular (fewer than 3 distinct x values).
+    Returns (b0, b1, b2, knot). Falls back to a linear fit if the system is
+    singular (fewer than 3 distinct x values, or nothing on one side).
     """
-    if len(set(xs)) < 3:
+    knot = statistics.median(xs)
+    if len(set(xs)) < 3 or all(x <= knot for x in xs) or all(x >= knot for x in xs):
         a, b = _ols(xs, ys)
-        return (a, b, 0.0)
-    rows = [[1.0, x, x * x] for x in xs]
+        return (a, b, 0.0, knot)
+    rows = [[1.0, x, max(0.0, x - knot)] for x in xs]
     ata = [[sum(r[i] * r[j] for r in rows) for j in range(3)] for i in range(3)]
     atb = [sum(r[i] * y for r, y in zip(rows, ys)) for i in range(3)]
     m = [ata[i][:] + [atb[i]] for i in range(3)]
@@ -96,7 +105,7 @@ def _quad_fit(xs, ys):
         piv = max(range(i, 3), key=lambda r: abs(m[r][i]))
         if abs(m[piv][i]) < 1e-12:
             a, b = _ols(xs, ys)
-            return (a, b, 0.0)
+            return (a, b, 0.0, knot)
         m[i], m[piv] = m[piv], m[i]
         for r in range(i + 1, 3):
             f = m[r][i] / m[i][i]
@@ -105,7 +114,10 @@ def _quad_fit(xs, ys):
     beta = [0.0, 0.0, 0.0]
     for i in (2, 1, 0):
         beta[i] = (m[i][3] - sum(m[i][j] * beta[j] for j in range(i + 1, 3))) / m[i][i]
-    return (beta[0], beta[1], beta[2])
+    if any(not math.isfinite(v) for v in beta):
+        a, b = _ols(xs, ys)
+        return (a, b, 0.0, knot)
+    return (beta[0], beta[1], beta[2], knot)
 
 
 def _launch_curve(comparable):
@@ -151,36 +163,78 @@ def _pooled_quantiles(p1, h, curves):
     return [max(Q_FLOOR, p1 * math.exp(_quantile_sorted(xs, tau))) for tau in LEVELS]
 
 
-def forecast_hour(p1, h, curves):
-    """The five quantiles for hour h given hour-1 print p1 and the curves."""
-    # Per-hour sample: comparables with both hour 1 and hour h present.
-    sample = [(c[0], c[h - 1]) for c in curves
-              if c[0] is not None and c[h - 1] is not None and c[0] > 0 and c[h - 1] > 0]
-    if len(sample) < 5:
-        return _pooled_quantiles(p1, h, curves)
-    lps = [math.log(v1) for v1, _ in sample]
-    ys = [math.log(vh / v1) for v1, vh in sample]
-    lp1 = min(max(math.log(max(1.0, p1)), min(lps)), max(lps))
-    b0, b1, b2 = _quad_fit(lps, ys)
-    mu = b0 + b1 * lp1 + b2 * lp1 * lp1
-    resid = [y - (b0 + b1 * x + b2 * x * x) for x, y in zip(lps, ys)]
-    # Median shift: q50 must be the conditional median, not the mean.
-    med = statistics.median(resid)
-    mu += med
-    resid = [r - med for r in resid]
-    # Heteroscedastic scale: |residual| ~ ln(p1).
-    abs_resid = [abs(r) for r in resid]
-    mean_abs = statistics.mean(abs_resid)
+def _fit_all_hours(p1, hours, curves):
+    """Fit every requested hour and return (per_hour, scale).
+
+    per_hour[h] = (mu, sorted_residuals) with mu the median-shifted fitted
+    log-ratio at the target's ln(p1), clamped to that hour's comparables'
+    observed range. Hours with fewer than 5 comparables are left out; the
+    caller fills them from pooled empirical quantiles.
+
+    scale is ONE heteroscedastic factor pooled over all fitted hours:
+    |residual| regressed on ln(p1) across every (comparable, hour) pair,
+    evaluated at the target's ln(p1) (clamped to the global comparables'
+    range) and clamped to [SCALE_MIN, SCALE_MAX]. A per-hour fit from ~36
+    points is noisy; the pooled fit uses ~850.
+    """
+    lp1 = math.log(max(1.0, p1))
+    all_lps = [math.log(c[0]) for c in curves
+               if c[0] is not None and c[0] > 0]
+    global_lo, global_hi = (min(all_lps), max(all_lps)) if all_lps else (lp1, lp1)
+    lp1g = min(max(lp1, global_lo), global_hi)
+    per_hour = {}
+    all_abs, all_lp = [], []
+    for h in hours:
+        sample = [(c[0], c[h - 1]) for c in curves
+                  if c[0] is not None and c[h - 1] is not None
+                  and c[0] > 0 and c[h - 1] > 0]
+        if len(sample) < 5:
+            continue
+        lps = [math.log(v1) for v1, _ in sample]
+        ys = [math.log(vh / v1) for v1, vh in sample]
+        lp1c = min(max(lp1, min(lps)), max(lps))
+        b0, b1, b2, knot = _piecewise_fit(lps, ys)
+        mu = b0 + b1 * lp1c + b2 * max(0.0, lp1c - knot)
+        resid = [y - (b0 + b1 * x + b2 * max(0.0, x - knot))
+                 for x, y in zip(lps, ys)]
+        # Median shift: q50 must be the conditional median, not the mean.
+        med = statistics.median(resid)
+        mu += med
+        resid = [r - med for r in resid]
+        per_hour[h] = (mu, sorted(resid))
+        all_abs.extend(abs(r) for r in resid)
+        all_lp.extend(lps)
     scale = 1.0
-    if mean_abs > 0:
-        ah, bh = _ols(lps, abs_resid)
-        scale = min(SCALE_MAX, max(SCALE_MIN, (ah + bh * lp1) / mean_abs))
-    rs = sorted(resid)
-    qs = [p1 * math.exp(mu + _quantile_sorted(rs, tau) * scale) for tau in LEVELS]
+    if all_abs:
+        mean_abs = statistics.mean(all_abs)
+        if mean_abs > 0:
+            ah, bh = _ols(all_lp, all_abs)
+            scale = min(SCALE_MAX, max(SCALE_MIN, (ah + bh * lp1g) / mean_abs))
+    return per_hour, scale
+
+
+def _hour_quantiles(p1, h, curves, per_hour, scale):
+    """The five quantiles for hour h from a fitted model, with fallbacks."""
+    if h in per_hour:
+        mu, rs = per_hour[h]
+        qs = [p1 * math.exp(mu + _quantile_sorted(rs, tau) * scale)
+              for tau in LEVELS]
+    else:
+        return _pooled_quantiles(p1, h, curves)
     qs = [min(Q_CAP, max(Q_FLOOR, q)) for q in qs]
     for i in range(1, 5):
         qs[i] = max(qs[i], qs[i - 1])
     return qs
+
+
+def forecast_hour(p1, h, curves):
+    """The five quantiles for hour h given hour-1 print p1 and the curves.
+
+    Fits all hours so the pooled heteroscedastic scale matches what
+    forecast_case uses; the per-hour fits are cheap.
+    """
+    per_hour, scale = _fit_all_hours(p1, list(range(2, 25)), curves)
+    return _hour_quantiles(p1, h, curves, per_hour, scale)
 
 
 def forecast_case(case):
@@ -192,8 +246,7 @@ def forecast_case(case):
         raise ValueError("case has no hour-1 print")
     p1 = max(1.0, float(first["viewers"]))
     curves = _comparable_curves(case)
-    hours = []
-    for row in case["forecast"]:
-        h = row["hour"]
-        hours.append({"hour": h, "q": forecast_hour(p1, h, curves)})
-    return {"hours": hours}
+    hours = [row["hour"] for row in case["forecast"]]
+    per_hour, scale = _fit_all_hours(p1, hours, curves)
+    return {"hours": [{"hour": h, "q": _hour_quantiles(p1, h, curves, per_hour, scale)}
+                      for h in hours]}
